@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>AD8232 心电波形</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #101618;
+      color: #e6efed;
+      font: 16px system-ui, "Microsoft YaHei", sans-serif;
+    }
+    main { max-width: 1100px; margin: auto; padding: clamp(16px, 4vw, 48px); }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+    h1 { margin: 0; font-size: clamp(23px, 4vw, 36px); }
+    #status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border: 1px solid #36524d;
+      border-radius: 6px;
+      color: #a6e6d4;
+      font-size: 14px;
+    }
+    #status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    #status[data-tone="wait"] { border-color: #454f51; color: #a6b5b7; }
+    #status[data-tone="warning"] { border-color: #6a553a; color: #ffd297; }
+    #status[data-tone="error"] { border-color: #743f46; color: #ffabb2; }
+    .heart-rate {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      margin-top: 18px;
+      color: #a5baba;
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    #pulse { color: #815d53; font-size: 18px; }
+    #pulse[data-beat="true"] { color: #ffd297; }
+    #bpm { color: #e6efed; font-size: 23px; }
+    section { margin-top: 22px; background: #121c1e; border: 1px solid #2d4143; border-radius: 10px; overflow: hidden; }
+    .scale {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      column-gap: 14px;
+      row-gap: 4px;
+      padding: 12px 15px;
+      border-bottom: 1px solid #2d4143;
+      color: #a5baba;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+    canvas { display: block; width: 100%; height: clamp(230px, 55vh, 500px); background: #0a1214; }
+    #acquisition-stats { margin: 12px 0 0; color: #a5baba; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>AD8232 心电波形</h1>
+      <span id="status" role="status" data-tone="wait">正在连接</span>
+    </header>
+    <div class="heart-rate">
+      <span id="pulse" aria-hidden="true">♥</span>
+      <span>估算心率</span>
+      <strong id="bpm">--</strong>
+      <span>BPM</span>
+    </div>
+    <section aria-label="实时波形">
+      <div class="scale">
+        <span id="timebase">实时波形</span>
+        <span>AD8232 OUT · mV</span>
+      </div>
+      <canvas id="wave" role="img" aria-label="AD8232 实时电压波形"></canvas>
+    </section>
+    <p id="acquisition-stats" hidden></p>
+  </main>
+  <script>
+    const canvas = document.querySelector('#wave');
+    const ctx = canvas.getContext('2d');
+    const status = document.querySelector('#status');
+    const timebase = document.querySelector('#timebase');
+    const acquisitionStats = document.querySelector('#acquisition-stats');
+    const bpm = document.querySelector('#bpm');
+    const pulse = document.querySelector('#pulse');
+    const headerBytes = 8;
+    const missing = -2147483648;
+    const codesPerMv = 8;
+    const signals = [
+      ['等待采样', 'wait'],
+      ['实时采样', 'live'],
+      ['模拟波形', 'live'],
+      ['导联脱落', 'warning'],
+      ['ADC 读取错误', 'error'],
+      ['输入饱和', 'warning'],
+    ];
+    let sampleHz = 0;
+    let seconds = 3;
+    let samples = [];
+    let peaks = [];
+    let lastSequence;
+    let lastAdvance = 0;
+    let lastPeak;
+    let pulseUntil = 0;
+
+    function setStatus(label, tone) {
+      if (status.textContent !== label) status.textContent = label;
+      status.dataset.tone = tone;
+    }
+
+    function setHeartRate(rate, beat) {
+      const label = rate ? String(rate) : '--';
+      if (bpm.textContent !== label) bpm.textContent = label;
+      pulse.dataset.beat = beat ? 'true' : 'false';
+    }
+
+    function showStats(header) {
+      const values = header ? header.split(',').map(Number) : [];
+      acquisitionStats.hidden = values.length !== 4 || !values.every(Number.isFinite) ||
+        values.every((value) => value === 0);
+      if (acquisitionStats.hidden) return;
+      const [rate, missed, errors, drops] = values;
+      const label = '实测 ' + (rate / 100).toFixed(1) + ' 点/秒 · 累计定时漏采 ' + missed +
+        ' · ADC 错误 ' + errors + ' · 显示队列丢点 ' + drops;
+      if (acquisitionStats.textContent !== label) acquisitionStats.textContent = label;
+    }
+
+    function draw() {
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const pixelWidth = Math.round(width * ratio);
+      const pixelHeight = Math.round(height * ratio);
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+      }
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      if (width <= 70 || height <= 50) return;
+
+      let low = Infinity;
+      let high = -Infinity;
+      for (const code of samples) {
+        if (code === missing) continue;
+        low = Math.min(low, code / codesPerMv);
+        high = Math.max(high, code / codesPerMv);
+      }
+      const hasData = low <= high;
+      const step = hasData ? Math.max(50, Math.ceil((high - low) / 150) * 50) : 50;
+      const center = hasData ? Math.round((low + high) / (2 * step)) * step : 1650;
+      const left = 51;
+      const right = width - 16;
+      const top = 16;
+      const bottom = height - 29;
+      const divisions = seconds * 5;
+
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.fillStyle = '#a5baba';
+      ctx.textBaseline = 'middle';
+      for (let i = 0; i <= divisions; i++) {
+        const x = left + i * (right - left) / divisions;
+        ctx.strokeStyle = i % 5 === 0 ? '#355053' : '#213437';
+        ctx.beginPath();
+        ctx.moveTo(x, top);
+        ctx.lineTo(x, bottom);
+        ctx.stroke();
+        if (i % 5 === 0) {
+          ctx.textAlign = i === divisions ? 'right' : 'center';
+          ctx.fillText((i / 5 - seconds) + ' s', x, bottom + 15);
+        }
+      }
+      ctx.textAlign = 'right';
+      for (let i = 0; i <= 4; i++) {
+        const y = top + i * (bottom - top) / 4;
+        ctx.strokeStyle = i === 2 ? '#355053' : '#213437';
+        ctx.beginPath();
+        ctx.moveTo(left, y);
+        ctx.lineTo(right, y);
+        ctx.stroke();
+        if (hasData) ctx.fillText(center + (2 - i) * step, left - 7, y);
+      }
+      if (!hasData) return;
+
+      ctx.strokeStyle = '#67e9be';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let join = false;
+      const dx = (right - left) / (sampleHz * seconds);
+      const voltageY = (code) => (top + bottom) / 2 -
+        (code / codesPerMv - center) * (bottom - top) / (4 * step);
+      for (let i = 0; i < samples.length; i++) {
+        if (samples[i] === missing) {
+          join = false;
+          continue;
+        }
+        const x = right - (samples.length - 1 - i) * dx;
+        const y = voltageY(samples[i]);
+        if (join) ctx.lineTo(x, y);
+        else ctx.moveTo(x, y);
+        join = true;
+      }
+      ctx.stroke();
+      ctx.lineWidth = 1;
+
+      ctx.fillStyle = '#ffd297';
+      for (const age of peaks) {
+        const code = samples[samples.length - 1 - age];
+        if (code === missing) continue;
+        ctx.beginPath();
+        ctx.arc(right - age * dx, voltageY(code), 3, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+    }
+
+    async function update() {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000);
+      let delay = 150;
+      try {
+        const url = lastSequence === undefined ? '/wave' : '/wave?after=' + lastSequence;
+        const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const frame = new DataView(await response.arrayBuffer());
+        if (frame.byteLength < headerBytes || (frame.byteLength - headerBytes) % 4 !== 0) {
+          throw new Error('Invalid waveform frame');
+        }
+        const sequence = frame.getUint32(0, true);
+        const rate = frame.getUint16(4, true);
+        const signal = frame.getUint8(6);
+        const windowSeconds = frame.getUint8(7);
+        const count = (frame.byteLength - headerBytes) / 4;
+        const capacity = rate * windowSeconds;
+        const incremental = response.headers.get('X-ECG-Delta') === '1';
+        if (!rate || !windowSeconds || count > capacity || signal >= signals.length ||
+            (incremental && (lastSequence === undefined || rate !== sampleHz || windowSeconds !== seconds ||
+                            count !== ((sequence - lastSequence) >>> 0)))) {
+          throw new Error('Invalid waveform metadata');
+        }
+        const heartRate = Number(response.headers.get('X-ECG-BPM')) || 0;
+        if (sampleHz !== rate || seconds !== windowSeconds) {
+          sampleHz = rate;
+          seconds = windowSeconds;
+          timebase.textContent = '最近 ' + seconds + ' 秒 · 目标 ' + sampleHz + ' 点/秒';
+        }
+        const now = performance.now();
+        if (sequence !== lastSequence) {
+          lastSequence = sequence;
+          lastAdvance = now;
+          const received = Array.from({length: count}, (_, i) => frame.getInt32(headerBytes + i * 4, true));
+          samples = incremental ? samples.concat(received).slice(-capacity) : received;
+          const ages = response.headers.get('X-ECG-QRS-Ages');
+          peaks = ages ? ages.split(',').map(Number)
+            .filter((age) => Number.isInteger(age) && age >= 0 && age < samples.length) : [];
+          draw();
+        }
+        if (now - lastAdvance > 1500) {
+          if (samples.length) {
+            samples = [];
+            peaks = [];
+            draw();
+          }
+          showStats(null);
+          pulseUntil = 0;
+          setHeartRate(0, false);
+          setStatus('等待新采样', 'warning');
+        } else {
+          const usable = signal === 1 || signal === 2;
+          if (usable && peaks[0] <= rate * 0.45) {
+            const peak = (sequence - peaks[0]) >>> 0;
+            if (peak !== lastPeak) {
+              lastPeak = peak;
+              pulseUntil = now + 150;
+            }
+          }
+          if (!usable) pulseUntil = 0;
+          setHeartRate(usable ? heartRate : 0, now < pulseUntil);
+          showStats(response.headers.get('X-ECG-Stats'));
+          setStatus(...signals[signal]);
+        }
+      } catch {
+        lastSequence = undefined;
+        lastPeak = undefined;
+        pulseUntil = 0;
+        if (samples.length) {
+          samples = [];
+          peaks = [];
+          draw();
+        }
+        showStats(null);
+        setHeartRate(0, false);
+        setStatus('连接中断，正在重试', 'error');
+        delay = 1000;
+      } finally {
+        clearTimeout(timeout);
+        setTimeout(update, delay);
+      }
+    }
+
+    new ResizeObserver(draw).observe(canvas);
+    update();
+  </script>
+</body>
+</html>

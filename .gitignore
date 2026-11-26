@@ -1,0 +1,4 @@
+/firmware.zip
+/firmware/.vscode/
+__pycache__/
+*.py[cod]
